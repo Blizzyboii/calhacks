@@ -82,8 +82,10 @@ async function getOrchestratorMemory(conversationId) {
 
 // Helper function to extract and parse URLs from text
 async function extractLinksContent(text) {
-  const urlRegex = /(https?:\/\/[^\s<>]+)/g;
-  const urls = text.match(urlRegex) || [];
+  // Slack wraps URLs in <>, so we need to handle both formats
+  const urlRegex = /<?(https?:\/\/[^\s<>|]+)[|>]?/g;
+  const matches = [...text.matchAll(urlRegex)];
+  const urls = matches.map(match => match[1]);
   const extractedContent = [];
   
   for (const url of urls) {
@@ -559,13 +561,22 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       console.log(`[INFO] Final media count: ${media.images.length} images, ${media.videos.length} videos`);
     }
     
-    // Extract content from any links in the message
-    const linkContent = await extractLinksContent(messageText);
-    if (linkContent.length > 0) {
-      console.log(`[INFO] Found ${linkContent.length} links with content`);
+    // Extract content from any links in the current message AND recent messages
+    let allLinkContent = await extractLinksContent(messageText);
+    
+    // Also check recent messages for links
+    for (const msg of recentMessages.slice(0, 10)) {
+      if (msg.text) {
+        const msgLinks = await extractLinksContent(msg.text);
+        allLinkContent = allLinkContent.concat(msgLinks);
+      }
+    }
+    
+    if (allLinkContent.length > 0) {
+      console.log(`[INFO] Found ${allLinkContent.length} links with content`);
       
       // Store each link's content in Letta for future reference
-      for (const link of linkContent) {
+      for (const link of allLinkContent) {
         await sendToOrchestrator(
           `Document from ${link.url}: ${link.content}`,
           {
@@ -577,7 +588,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
           true // Store only, don't respond
         ).catch(err => console.error(`[ERROR] Failed to store link content: ${err.message}`));
       }
-      console.log(`[SUCCESS] Stored ${linkContent.length} link contents in Letta`);
+      console.log(`[SUCCESS] Stored ${allLinkContent.length} link contents in Letta`);
     }
     
     // Store all recent messages in Letta asynchronously (don't block response)
