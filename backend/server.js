@@ -80,6 +80,72 @@ async function getOrchestratorMemory(conversationId) {
   }
 }
 
+// Helper function to extract and parse URLs from text
+async function extractLinksContent(text) {
+  const urlRegex = /(https?:\/\/[^\s<>]+)/g;
+  const urls = text.match(urlRegex) || [];
+  const extractedContent = [];
+  
+  for (const url of urls) {
+    try {
+      console.log(`[INFO] Extracting content from: ${url}`);
+      
+      // Check if it's a Google Doc
+      if (url.includes('docs.google.com')) {
+        // Convert to export URL for plain text
+        const docId = url.match(/\/d\/([a-zA-Z0-9-_]+)/)?.[1];
+        if (docId) {
+          const exportUrl = `https://docs.google.com/document/d/${docId}/export?format=txt`;
+          const response = await axios.get(exportUrl, { timeout: 10000 });
+          extractedContent.push({
+            url,
+            type: 'google_doc',
+            content: response.data,
+            title: 'Google Doc'
+          });
+          console.log(`[SUCCESS] Extracted Google Doc content (${response.data.length} chars)`);
+        }
+      }
+      // Check if it's a Notion page
+      else if (url.includes('notion.so') || url.includes('notion.site')) {
+        // Notion requires API key, so we'll use a web scraper approach
+        const response = await axios.get(url, { 
+          timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        // Basic HTML text extraction (you may want to use cheerio for better parsing)
+        const text = response.data.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        extractedContent.push({
+          url,
+          type: 'notion',
+          content: text.substring(0, 5000), // Limit to 5000 chars
+          title: 'Notion Page'
+        });
+        console.log(`[SUCCESS] Extracted Notion content (${text.length} chars)`);
+      }
+      // General web page
+      else {
+        const response = await axios.get(url, { 
+          timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        const text = response.data.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        extractedContent.push({
+          url,
+          type: 'webpage',
+          content: text.substring(0, 3000), // Limit to 3000 chars
+          title: 'Web Page'
+        });
+        console.log(`[SUCCESS] Extracted web content (${text.length} chars)`);
+      }
+    } catch (err) {
+      console.error(`[ERROR] Failed to extract from ${url}: ${err.message}`);
+    }
+  }
+  
+  return extractedContent;
+}
+
 // Function to detect and extract media from Slack message
 async function extractMediaFromMessage(message, slackClient = null) {
   const media = {
@@ -491,6 +557,27 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     
     if (media.hasMedia) {
       console.log(`[INFO] Final media count: ${media.images.length} images, ${media.videos.length} videos`);
+    }
+    
+    // Extract content from any links in the message
+    const linkContent = await extractLinksContent(messageText);
+    if (linkContent.length > 0) {
+      console.log(`[INFO] Found ${linkContent.length} links with content`);
+      
+      // Store each link's content in Letta for future reference
+      for (const link of linkContent) {
+        await sendToOrchestrator(
+          `Document from ${link.url}: ${link.content}`,
+          {
+            channelId,
+            userId,
+            conversationId,
+            timestamp: new Date().toISOString()
+          },
+          true // Store only, don't respond
+        ).catch(err => console.error(`[ERROR] Failed to store link content: ${err.message}`));
+      }
+      console.log(`[SUCCESS] Stored ${linkContent.length} link contents in Letta`);
     }
     
     // Store all recent messages in Letta asynchronously (don't block response)
