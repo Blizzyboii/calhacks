@@ -7,6 +7,9 @@ import bodyParser from 'body-parser';
 import bolt from '@slack/bolt';
 const { App, LogLevel } = bolt;
 
+// Verify token is loaded
+console.log('[INFO] SLACK_BOT_TOKEN loaded:', process.env.SLACK_BOT_TOKEN ? 'Yes' : 'No');
+
 // Initialize Express app
 const expressApp = express();
 expressApp.use(bodyParser.json());
@@ -77,6 +80,142 @@ async function getOrchestratorMemory(conversationId) {
   }
 }
 
+// Function to detect and extract media from Slack message
+async function extractMediaFromMessage(message, slackClient = null) {
+  const media = {
+    hasMedia: false,
+    images: [],
+    videos: [],
+    files: []
+  };
+  
+  // Check for files attached to message
+  if (message.files && message.files.length > 0) {
+    for (const file of message.files) {
+      const fileType = file.mimetype || '';
+      
+      if (fileType.startsWith('image/')) {
+        try {
+          console.log(`[INFO] Processing image: ${file.name}, ID: ${file.id}`);
+          
+          // Use Slack's files.info API (now we have files:read scope!)
+          const fileInfo = await slackClient.files.info({
+            file: file.id
+          });
+          
+          console.log(`[DEBUG] File info retrieved, downloading...`);
+          
+          // Try URLs in order
+          const urls = [
+            fileInfo.file.url_private_download,
+            fileInfo.file.url_private,
+            file.url_private_download,
+            file.url_private
+          ].filter(Boolean);
+          
+          let imageData = null;
+          let finalContentType = null;
+          
+          for (const url of urls) {
+            try {
+              console.log(`[DEBUG] Trying: ${url.substring(0, 50)}...`);
+              const response = await axios.get(url, {
+                headers: {
+                  'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`
+                },
+                responseType: 'arraybuffer',
+                timeout: 10000
+              });
+              
+              const ct = response.headers['content-type'];
+              if (ct && ct.startsWith('image/')) {
+                imageData = response.data;
+                finalContentType = ct;
+                console.log(`[SUCCESS] ✓ Downloaded ${imageData.length} bytes`);
+                break;
+              }
+            } catch (err) {
+              console.log(`[WARN] Failed: ${err.message}`);
+            }
+          }
+          
+          if (!imageData) {
+            throw new Error('All URLs failed');
+          }
+          
+          const base64 = Buffer.from(imageData).toString('base64');
+          const dataUrl = `data:${finalContentType};base64,${base64}`;
+          
+          media.images.push({
+            url: dataUrl,
+            name: file.name,
+            mimetype: finalContentType,
+            title: file.title
+          });
+          console.log(`[SUCCESS] ✓✓✓ Image ready: ${file.name}`);
+          media.hasMedia = true;
+        } catch (err) {
+          console.error(`[ERROR] Image failed: ${err.message}`);
+        }
+      } else if (fileType.startsWith('video/')) {
+        media.videos.push({
+          url: file.url_private || file.permalink,
+          name: file.name,
+          mimetype: file.mimetype,
+          title: file.title,
+          slackToken: process.env.SLACK_BOT_TOKEN // Add token for auth
+        });
+        media.hasMedia = true;
+      } else {
+        media.files.push({
+          url: file.url_private || file.permalink,
+          name: file.name,
+          mimetype: file.mimetype,
+          title: file.title
+        });
+      }
+    }
+  }
+  
+  // Check for image URLs in text (common image hosting patterns)
+  if (message.text) {
+    const imageUrlPatterns = [
+      /https?:\/\/.*\.(jpg|jpeg|png|gif|webp|bmp|svg)/gi,
+      /https?:\/\/(i\.)?imgur\.com\/\w+/gi,
+      /https?:\/\/.*giphy\.com\/.*\.gif/gi
+    ];
+    
+    for (const pattern of imageUrlPatterns) {
+      const matches = message.text.match(pattern);
+      if (matches) {
+        matches.forEach(url => {
+          media.images.push({ url, source: 'text_link' });
+          media.hasMedia = true;
+        });
+      }
+    }
+    
+    // Check for video URLs
+    const videoUrlPatterns = [
+      /https?:\/\/(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/)[\w-]+/gi,
+      /https?:\/\/(www\.)?vimeo\.com\/\d+/gi,
+      /https?:\/\/.*\.(mp4|webm|mov|avi)/gi
+    ];
+    
+    for (const pattern of videoUrlPatterns) {
+      const matches = message.text.match(pattern);
+      if (matches) {
+        matches.forEach(url => {
+          media.videos.push({ url, source: 'text_link' });
+          media.hasMedia = true;
+        });
+      }
+    }
+  }
+  
+  return media;
+}
+
 // Webhook endpoint to receive Slack events
 expressApp.post('/slack/events', async (req, res) => {
   const { type, event, challenge } = req.body;
@@ -140,6 +279,108 @@ expressApp.post('/slack/events', async (req, res) => {
   res.status(200).send('OK');
 });
 
+// Store recent files per channel (for quick lookup)
+const recentFiles = new Map(); // channelId -> [{file, timestamp}]
+
+// Listen for file uploads
+slackApp.event('file_shared', async ({ event, client }) => {
+  console.log(`[INFO] File shared in channel ${event.channel_id}`);
+  
+  try {
+    // Get file info
+    const result = await client.files.info({
+      file: event.file_id
+    });
+    
+    const file = result.file;
+    console.log(`[INFO] File details: ${file.name} (${file.mimetype})`);
+    
+    // If it's an image, download and analyze it immediately
+    if (file.mimetype && file.mimetype.startsWith('image/')) {
+      console.log(`[INFO] Image detected, analyzing immediately...`);
+      
+      try {
+        const fileInfo = await client.files.info({ file: file.id });
+        const urls = [
+          fileInfo.file.url_private_download,
+          fileInfo.file.url_private
+        ].filter(Boolean);
+        
+        let imageData = null;
+        for (const url of urls) {
+          try {
+            const response = await axios.get(url, {
+              headers: { 'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+              responseType: 'arraybuffer',
+              timeout: 10000
+            });
+            
+            if (response.headers['content-type']?.startsWith('image/')) {
+              imageData = response.data;
+              break;
+            }
+          } catch (err) {
+            continue;
+          }
+        }
+        
+        if (imageData) {
+          const base64 = Buffer.from(imageData).toString('base64');
+          const dataUrl = `data:${file.mimetype};base64,${base64}`;
+          
+          // Send to orchestrator for immediate analysis
+          const analysisResult = await sendToOrchestrator(`Analyze this image: ${file.name}`, {
+            channelId: event.channel_id,
+            userId: event.user_id,
+            conversationId: event.channel_id,
+            media: {
+              hasMedia: true,
+              images: [{ url: dataUrl, name: file.name, mimetype: file.mimetype }],
+              videos: [],
+              files: []
+            }
+          });
+          
+          console.log(`[SUCCESS] Image analyzed and stored: ${file.name}`);
+          
+          // Store the description in Letta for future reference
+          await sendToOrchestrator(`Image "${file.name}" was uploaded. Description: ${analysisResult.response}`, {
+            channelId: event.channel_id,
+            userId: event.user_id,
+            conversationId: event.channel_id,
+            timestamp: new Date().toISOString()
+          }, true);
+          
+          console.log(`[SUCCESS] Image description stored in Letta`);
+        }
+      } catch (analyzeErr) {
+        console.error(`[ERROR] Failed to analyze image: ${analyzeErr.message}`);
+      }
+    }
+    
+    // Store file reference with timestamp
+    const channelId = event.channel_id;
+    if (!recentFiles.has(channelId)) {
+      recentFiles.set(channelId, []);
+    }
+    
+    const channelFilesList = recentFiles.get(channelId);
+    channelFilesList.unshift({
+      file: file,
+      timestamp: Date.now()
+    });
+    
+    // Keep only last 5 files per channel
+    if (channelFilesList.length > 5) {
+      channelFilesList.pop();
+    }
+    
+    console.log(`[INFO] Stored file reference for channel ${channelId}`);
+  } catch (error) {
+    console.error('Error handling file_shared event:', error);
+  }
+});
+
 // Listen to all messages in channels (for storing in Letta)
 slackApp.event('message', async ({ event, client, logger }) => {
   // Ignore bot messages and message changes/deletes
@@ -166,6 +407,7 @@ slackApp.event('message', async ({ event, client, logger }) => {
 slackApp.event('app_mention', async ({ event, client, logger }) => {
   console.log(`[INFO] RECEIVED APP MENTION from ${event.user} in ${event.channel}`);
   console.log(`[INFO] Message: ${event.text}`);
+  console.log(`[DEBUG] Event has files:`, event.files ? `Yes (${event.files.length})` : 'No');
   logger.info(`got app_mention from ${event.user} in ${event.channel}`);
   
   try {
@@ -177,6 +419,79 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     
     // Read recent messages for context
     const recentMessages = await readChannelMessages(channelId, 100);
+    
+    // Check if the question is about visual content
+    const isVisualQuery = /\b(image|picture|photo|screenshot|show|see|look|visual|what'?s in|describe|analyze)\b/i.test(messageText);
+    console.log(`[DEBUG] Is visual query: ${isVisualQuery}`);
+    
+    // Detect media - only if it's a visual query
+    let media = { hasMedia: false, images: [], videos: [], files: [] };
+    
+    if (isVisualQuery) {
+      media = await extractMediaFromMessage(event, client);
+      
+      if (!media.hasMedia) {
+        // Check if there are recent files uploaded to this channel
+        const channelFiles = recentFiles.get(channelId);
+        if (channelFiles && channelFiles.length > 0) {
+          console.log(`[INFO] Checking ${channelFiles.length} recent files in channel...`);
+          
+          // Use the most recent file (within last 2 minutes)
+          const recentFile = channelFiles[0];
+          const fileAge = Date.now() - recentFile.timestamp;
+          
+          if (fileAge < 120000) { // 2 minutes
+            const file = recentFile.file;
+            const fileType = file.mimetype || '';
+            
+            media = { hasMedia: true, images: [], videos: [], files: [] };
+            
+            if (fileType.startsWith('image/')) {
+              // For Slack private URLs, we need to provide the public URL or download it
+              // Use url_private_download which is more reliable
+              const imageData = {
+                url: file.url_private_download || file.url_private,
+                name: file.name,
+                mimetype: file.mimetype,
+                title: file.title,
+                slackToken: process.env.SLACK_BOT_TOKEN // Pass token for auth
+              };
+              media.images.push(imageData);
+              console.log(`[INFO] Using recent file: ${file.name} (image)`);
+              console.log(`[DEBUG] Image slackToken present: ${!!imageData.slackToken}`);
+            } else if (fileType.startsWith('video/')) {
+              media.videos.push({
+                url: file.url_private,
+                name: file.name,
+                mimetype: file.mimetype,
+                title: file.title
+              });
+              console.log(`[INFO] Using recent file: ${file.name} (video)`);
+            }
+          }
+        }
+      }
+      
+      // Fallback: check recent messages if still no media
+      if (!media.hasMedia && recentMessages.length > 0) {
+        console.log('[INFO] No recent files, checking recent messages...');
+        for (let i = 0; i < Math.min(5, recentMessages.length); i++) {
+          const msg = recentMessages[i];
+          const msgMedia = await extractMediaFromMessage(msg, client);
+          if (msgMedia.hasMedia) {
+            media = msgMedia;
+            console.log(`[INFO] Found media in recent message: ${media.images.length} images, ${media.videos.length} videos`);
+            break;
+          }
+        }
+      }
+    } else {
+      console.log('[INFO] Not a visual query, skipping image processing');
+    }
+    
+    if (media.hasMedia) {
+      console.log(`[INFO] Final media count: ${media.images.length} images, ${media.videos.length} videos`);
+    }
     
     // Store all recent messages in Letta asynchronously (don't block response)
     console.log(`[INFO] Storing ${recentMessages.length} recent messages in Letta (async)...`);
@@ -204,21 +519,40 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
         userId,
         recentMessages,
         memory,
-        conversationId
+        conversationId,
+        media: media.hasMedia ? media : undefined
       });
       
       // Post orchestrator response back to Slack
       if (orchestratorResponse.response) {
+        let responseText = orchestratorResponse.response;
+        
+        // Add citations if we used recent messages for context
+        if (recentMessages.length > 0) {
+          const relevantMessages = recentMessages
+            .filter(msg => !msg.bot_id && msg.text)
+            .slice(0, 3); // Show up to 3 recent messages as sources
+          
+          if (relevantMessages.length > 0) {
+            responseText += '\n\n_Sources:_';
+            for (const msg of relevantMessages) {
+              const messageLink = `https://slack.com/archives/${channelId}/p${msg.ts.replace('.', '')}`;
+              const preview = msg.text.substring(0, 50) + (msg.text.length > 50 ? '...' : '');
+              responseText += `\n• <${messageLink}|${preview}>`;
+            }
+          }
+        }
+        
         await client.chat.postMessage({
           channel: event.channel,
           thread_ts: threadTs,
-          text: orchestratorResponse.response
+          text: responseText
         });
       } else {
         await client.chat.postMessage({
           channel: event.channel,
           thread_ts: threadTs,
-          text: 'I received your message but had trouble processing it. Please try again.'
+          text: "I processed your message but couldn't generate a response."
         });
       }
     } catch (orchestratorError) {
