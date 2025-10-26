@@ -42,12 +42,13 @@ async function readChannelMessages(channelId, limit = 100) {
 }
 
 // Function to send message to orchestrator
-async function sendToOrchestrator(message, context = {}) {
+async function sendToOrchestrator(message, context = {}, storeOnly = false) {
   try {
-    const response = await axios.post(`${ORCHESTRATOR_URL}/api/process`, {
+    const endpoint = storeOnly ? '/api/store' : '/api/process';
+    const response = await axios.post(`${ORCHESTRATOR_URL}${endpoint}`, {
       message: message,
       context: context,
-      timestamp: new Date().toISOString()
+      timestamp: context.timestamp || new Date().toISOString()
     }, {
       headers: {
         'Authorization': `Bearer ${ORCHESTRATOR_API_KEY}`,
@@ -139,10 +140,32 @@ expressApp.post('/slack/events', async (req, res) => {
   res.status(200).send('OK');
 });
 
+// Listen to all messages in channels (for storing in Letta)
+slackApp.event('message', async ({ event, client, logger }) => {
+  // Ignore bot messages and message changes/deletes
+  if (event.subtype || event.bot_id) {
+    return;
+  }
+  
+  console.log(`[INFO] Message in channel ${event.channel}: ${event.text}`);
+  
+  try {
+    // Store all messages in Letta for context
+    await sendToOrchestrator(event.text, {
+      channelId: event.channel,
+      userId: event.user,
+      conversationId: event.channel,
+      timestamp: new Date(parseFloat(event.ts) * 1000).toISOString()
+    }, true); // true = store only, don't generate response
+  } catch (error) {
+    console.error('Error storing message in Letta:', error.message);
+  }
+});
+
 // Handle app mentions
 slackApp.event('app_mention', async ({ event, client, logger }) => {
-  console.log(`🎉 RECEIVED APP MENTION from ${event.user} in ${event.channel}`);
-  console.log(`Message: ${event.text}`);
+  console.log(`[INFO] RECEIVED APP MENTION from ${event.user} in ${event.channel}`);
+  console.log(`[INFO] Message: ${event.text}`);
   logger.info(`got app_mention from ${event.user} in ${event.channel}`);
   
   try {
@@ -153,7 +176,23 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     const conversationId = `${channelId}_${threadTs}`;
     
     // Read recent messages for context
-    const recentMessages = await readChannelMessages(channelId, 10);
+    const recentMessages = await readChannelMessages(channelId, 100);
+    
+    // Store all recent messages in Letta asynchronously (don't block response)
+    console.log(`[INFO] Storing ${recentMessages.length} recent messages in Letta (async)...`);
+    Promise.all(
+      recentMessages
+        .filter(msg => !msg.bot_id && msg.text)
+        .slice(0, 20) // Only store last 20 to avoid overwhelming
+        .map(msg => 
+          sendToOrchestrator(msg.text, {
+            channelId: channelId,
+            userId: msg.user,
+            conversationId: channelId,
+            timestamp: new Date(parseFloat(msg.ts) * 1000).toISOString()
+          }, true).catch(e => {}) // Ignore errors
+        )
+    ).then(() => console.log(`[INFO] Finished storing recent messages`));
     
     // Get existing memory from orchestrator
     const memory = await getOrchestratorMemory(conversationId);
@@ -225,9 +264,9 @@ async function start() {
   // Start Slack app (Socket Mode doesn't need a port)
   try {
     await slackApp.start();
-    console.log(`✅ Slack bot is running (Socket Mode)`);
+    console.log(`[INFO] Slack bot is running (Socket Mode)`);
   } catch (error) {
-    console.error(`❌ Failed to start Slack bot:`, error);
+    console.error(`[ERROR] Failed to start Slack bot:`, error);
   }
 }
 
