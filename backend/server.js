@@ -141,6 +141,8 @@ expressApp.post('/slack/events', async (req, res) => {
 
 // Handle app mentions
 slackApp.event('app_mention', async ({ event, client, logger }) => {
+  console.log(`🎉 RECEIVED APP MENTION from ${event.user} in ${event.channel}`);
+  console.log(`Message: ${event.text}`);
   logger.info(`got app_mention from ${event.user} in ${event.channel}`);
   
   try {
@@ -156,27 +158,37 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Get existing memory from orchestrator
     const memory = await getOrchestratorMemory(conversationId);
     
-    // Send to orchestrator for processing
-    const orchestratorResponse = await sendToOrchestrator(messageText, {
-      channelId,
-      userId,
-      recentMessages,
-      memory,
-      conversationId
-    });
-    
-    // Post response back to Slack
-    if (orchestratorResponse.response) {
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: orchestratorResponse.response
+    // Try to send to orchestrator, but fallback if it fails
+    try {
+      const orchestratorResponse = await sendToOrchestrator(messageText, {
+        channelId,
+        userId,
+        recentMessages,
+        memory,
+        conversationId
       });
-    } else {
+      
+      // Post orchestrator response back to Slack
+      if (orchestratorResponse.response) {
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: orchestratorResponse.response
+        });
+      } else {
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: 'I received your message but had trouble processing it. Please try again.'
+        });
+      }
+    } catch (orchestratorError) {
+      console.log('Orchestrator not available, sending simple response');
+      // Fallback response when orchestrator is not available
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: threadTs,
-        text: 'I received your message but had trouble processing it. Please try again.'
+        text: `Hello! I received your message: "${messageText}". (Orchestrator not available - this is a fallback response)`
       });
     }
     
@@ -210,9 +222,13 @@ async function start() {
     console.log(`Express server running on port ${port}`);
   });
   
-  // Start Slack app
-  await slackApp.start();
-  console.log(`Slack bot is running (Socket Mode) on port ${port}`);
+  // Start Slack app (Socket Mode doesn't need a port)
+  try {
+    await slackApp.start();
+    console.log(`✅ Slack bot is running (Socket Mode)`);
+  } catch (error) {
+    console.error(`❌ Failed to start Slack bot:`, error);
+  }
 }
 
 start();

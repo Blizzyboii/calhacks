@@ -1,0 +1,27 @@
+{
+  "name": "orchestrator",
+  "version": "1.0.0",
+  "description": "Orchestrator service with Letta AI integration",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "orchestrator",
+    "letta",
+    "ai",
+    "slack"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@letta-ai/letta-client": "^0.0.68665",
+    "axios": "^1.12.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0"
+  }
+}
