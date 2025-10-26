@@ -29,8 +29,8 @@ LETTA_AGENT_ID=your_letta_agent_id_here
 ## Testing
 
 Once configured, the orchestrator will:
-- ✅ Store all Slack messages in Letta's archival memory
-- ✅ Query Letta for relevant past conversations
-- ✅ Pass that context to Lava for better responses
+- Store all Slack messages in Letta's archival memory
+- Query Letta for relevant past conversations
+- Pass that context to Lava for better responses
 
 If Letta is not configured, the bot will still work but without long-term memory.

@@ -7,7 +7,7 @@ import { initGitHubMCP, getRecentCommits, createGitHubIssue } from './github-mcp
 
 dotenv.config();
 
-console.log('🚀 ORCHESTRATOR CODE VERSION: 2024-10-26-04:36 🚀');
+console.log('🚀 ORCHESTRATOR CODE VERSION: 2024-10-26-07:52 🚀');
 
 const app = express();
 const port = process.env.PORT || 8000;
@@ -522,16 +522,21 @@ async function formatMessagesForGemini(messages, systemPrompt, media) {
   };
 }
 
+// Function to get orchestrator memory
+async function getOrchestratorMemory(conversationId) {
+  return conversationMemory.get(conversationId) || [];
+}
+
 // Intent detection function
 function detectIntent(message) {
   const lowerMessage = message.toLowerCase();
   
-  // GitHub intents
+  // GitHub intents - CHECK ISSUE CREATION FIRST (more specific)
+  if (/\b(create|file|open|make|add|new).*(issue|bug|ticket)\b/i.test(message)) {
+    return { type: 'github', action: 'create_issue' };
+  }
   if (/\b(commit|standup|what did.*do|what did.*change|daily update|progress)\b/i.test(message)) {
     return { type: 'github', action: 'list_commits' };
-  }
-  if (/\b(create|file|open|make).*(issue|bug|ticket)\b/i.test(message)) {
-    return { type: 'github', action: 'create_issue' };
   }
   
   // Image/visual intents
@@ -589,20 +594,52 @@ app.post('/api/process', async (req, res) => {
           console.log('[ORCHESTRATOR] Calling GitHub MCP list_commits...');
           const commits = await getRecentCommits('24h');
           
-          let summary = `📊 *Last 3 Commits*\n\n`;
-          commits.slice(0, 3).forEach((commit, i) => {
-            summary += `${i + 1}. *${commit.message}*\n`;
-            summary += `   _by ${commit.author} at ${new Date(commit.timestamp).toLocaleString()}_\n`;
-            summary += `   ${commit.sha}\n\n`;
-          });
+          console.log('[DEBUG] Commits type:', typeof commits);
+          console.log('[DEBUG] Is array:', Array.isArray(commits));
+          console.log('[DEBUG] Commits data:', JSON.stringify(commits, null, 2));
           
-          githubResult = summary;
+          // Handle if commits is a string (unparsed response)
+          if (typeof commits === 'string') {
+            githubResult = `📊 *Recent Commits*\n\n${commits}`;
+          } else if (Array.isArray(commits) && commits.length > 0) {
+            let summary = `📊 *Last 3 Commits*\n\n`;
+            commits.slice(0, 3).forEach((commit, i) => {
+              summary += `${i + 1}. *${commit.message}*\n`;
+              summary += `   _by ${commit.author} at ${new Date(commit.timestamp).toLocaleString()}_\n`;
+              summary += `   ${commit.sha}\n\n`;
+            });
+            githubResult = summary;
+          } else {
+            githubResult = '📊 No recent commits found or unable to parse commit data.';
+          }
         } else if (intent.action === 'create_issue') {
           console.log('[ORCHESTRATOR] Calling GitHub MCP create_issue...');
-          const title = message.replace(/create (an? )?(issue|bug|ticket) (for|about)?/i, '').trim();
+          
+          // Extract title by removing the "create issue" command part
+          let title = message
+            .replace(/\b(create|file|open|make|add|new)\b/i, '')
+            .replace(/\b(an?|the)?\s*(issue|bug|ticket)\b/i, '')
+            .replace(/\b(for|about|regarding)\b/i, '')
+            .trim();
+          
+          // If title is empty or too short, use a default
+          if (!title || title.length < 3) {
+            title = 'New issue from Slack';
+          }
+          
           const issue = await createGitHubIssue(title, `Created from Slack\n\n${message}`, ['from-slack']);
           
-          githubResult = `✅ *Issue Created!*\n\n*#${issue.number}: ${issue.title}*\n${issue.url}`;
+          console.log('[DEBUG] Issue result type:', typeof issue);
+          console.log('[DEBUG] Issue data:', JSON.stringify(issue, null, 2));
+          
+          // Handle if issue is a string (unparsed response)
+          if (typeof issue === 'string') {
+            githubResult = `✅ *Issue Created!*\n\n${issue}`;
+          } else if (issue && issue.number && issue.title) {
+            githubResult = `✅ *Issue Created!*\n\n*#${issue.number}: ${issue.title}*\n${issue.html_url || issue.url}`;
+          } else {
+            githubResult = `✅ *Issue creation response:*\n\n${JSON.stringify(issue, null, 2)}`;
+          }
         }
         
         console.log('[ORCHESTRATOR] GitHub MCP operation completed');

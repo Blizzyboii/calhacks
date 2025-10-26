@@ -606,14 +606,45 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Get existing memory from orchestrator
     const memory = await getOrchestratorMemory(conversationId);
     
-    // Check if user is asking for GitHub features
-    const isCommitSummary = /\b(commits?|standup|what did (i|we) (do|change|work on)|daily update|progress|github|repo)\b/i.test(messageText);
-    const isCreateIssue = /\b(create|file|open|make) (an? )?(issue|bug|ticket)\b/i.test(messageText);
+    // Check if user is asking for GitHub features - CHECK ISSUE CREATION FIRST
+    const isCreateIssue = /\b(create|file|open|make|add|new).*(issue|bug|ticket)\b/i.test(messageText);
+    const isCommitSummary = /\b(commits?|standup|what did (i|we) (do|change|work on)|daily update|progress)\b/i.test(messageText);
     
     console.log(`[DEBUG] isCommitSummary: ${isCommitSummary}, isCreateIssue: ${isCreateIssue}`);
     console.log(`[DEBUG] GITHUB_TOKEN present: ${process.env.GITHUB_TOKEN ? 'YES' : 'NO'}`);
     
-    // Handle GitHub queries directly with GitHub API
+    // Handle issue creation FIRST (more specific)
+    if (isCreateIssue && process.env.GITHUB_TOKEN) {
+      try {
+        console.log('[INFO] Creating GitHub issue...');
+        const issueTitle = messageText.replace(/<@[A-Z0-9]+>/g, '').replace(/\b(create|file|open|make|add|new)\b/i, '').replace(/\b(an?|the)?\s*(issue|bug|ticket)\b/i, '').replace(/\b(for|about|regarding)\b/i, '').trim();
+        
+        // If title is empty or too short, use a default
+        const finalTitle = (!issueTitle || issueTitle.length < 3) ? 'New issue from Slack' : issueTitle;
+        
+        const issue = await createIssue(
+          process.env.GITHUB_OWNER || 'Blizzyboii',
+          process.env.GITHUB_REPO || 'calhacks',
+          process.env.GITHUB_TOKEN,
+          finalTitle,
+          `Created from Slack by <@${userId}>\n\nOriginal message: ${messageText}`,
+          ['from-slack']
+        );
+        
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: `✅ *Issue Created!*\n\n*#${issue.number}: ${issue.title}*\n${issue.url}`
+        });
+        console.log('[SUCCESS] Created GitHub issue');
+        return; // Done - skip orchestrator
+      } catch (err) {
+        console.error('[ERROR] GitHub issue creation failed:', err.message);
+        // Fall through to orchestrator
+      }
+    }
+    
+    // Handle commit summary
     if (isCommitSummary && process.env.GITHUB_TOKEN) {
       try {
         console.log('[INFO] Fetching commits from GitHub API...');
@@ -640,32 +671,6 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
         return; // Done - skip orchestrator
       } catch (err) {
         console.error('[ERROR] GitHub API failed:', err.message);
-        // Fall through to orchestrator
-      }
-    }
-    
-    if (isCreateIssue && process.env.GITHUB_TOKEN) {
-      try {
-        console.log('[INFO] Creating GitHub issue...');
-        const issueTitle = messageText.replace(/<@[A-Z0-9]+>/g, '').replace(/create (an? )?(issue|bug|ticket) (for|about)?/i, '').trim();
-        const issue = await createIssue(
-          process.env.GITHUB_OWNER || 'Blizzyboii',
-          process.env.GITHUB_REPO || 'calhacks',
-          process.env.GITHUB_TOKEN,
-          issueTitle,
-          `Created from Slack by <@${userId}>\n\nOriginal message: ${messageText}`,
-          ['from-slack']
-        );
-        
-        await client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: `✅ *Issue Created!*\n\n*#${issue.number}: ${issue.title}*\n${issue.url}`
-        });
-        console.log('[SUCCESS] Created GitHub issue');
-        return; // Done - skip orchestrator
-      } catch (err) {
-        console.error('[ERROR] GitHub issue creation failed:', err.message);
         // Fall through to orchestrator
       }
     }
