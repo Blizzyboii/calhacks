@@ -3,8 +3,11 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import { LettaClient } from '@letta-ai/letta-client';
+import { initGitHubMCP, getRecentCommits, createGitHubIssue } from './github-mcp.js';
 
 dotenv.config();
+
+console.log('🚀 ORCHESTRATOR CODE VERSION: 2024-10-26-04:36 🚀');
 
 const app = express();
 const port = process.env.PORT || 8000;
@@ -45,6 +48,9 @@ if (LETTA_API_KEY) {
 } else {
   console.warn('[WARN] LETTA_API_KEY not found - Letta integration disabled');
 }
+
+// GitHub MCP client
+let githubMCPClient = null;
 
 // Check if API key is provided
 if (!LAVA_FORWARD_TOKEN) {
@@ -178,12 +184,18 @@ async function queryLettaContext(query, limit = 5) {
 }
 
 // Function to select appropriate model based on content
-function selectModel(hasMedia, mediaType) {
+function selectModel(hasMedia, mediaType, isCodeQuery = false) {
+  // Use Claude for code-related queries (GitHub, programming questions)
+  if (isCodeQuery) {
+    return 'claude-3-5-sonnet-20241022'; // Claude Sonnet 3.5 - excellent for code
+  }
+  
   // Use vision-capable models for visual content
   if (hasMedia) {
     // gpt-4o is the latest OpenAI vision model
     return 'gpt-4o';
   }
+  
   // Default to GPT-4o-mini for text-only
   return LAVA_MODEL || 'gpt-4o-mini';
 }
@@ -191,17 +203,24 @@ function selectModel(hasMedia, mediaType) {
 // Function to call Lava API with model routing
 async function callLavaAPI(messages, systemPrompt, media = null) {
   try {
+    // Detect if this is a code-related query
+    const messageText = messages.map(m => m.content).join(' ').toLowerCase();
+    const isCodeQuery = /\b(code|commit|github|repository|function|bug|error|debug|programming|syntax|implementation|algorithm|pull request|pr|issue)\b/i.test(messageText);
+    
     // Select appropriate model based on media content
     let selectedModel = LAVA_MODEL;
     let enhancedMessages = messages;
     let targetURL = OPENAI_URL;
     
+    // Check if there's media content
     if (media && media.hasMedia) {
       const hasVideos = media.videos && media.videos.length > 0;
-      const hasImages = media.images && media.images.length > 0;
-      
-      selectedModel = selectModel(true, hasVideos ? 'video' : 'image');
+      selectedModel = selectModel(true, hasVideos ? 'video' : 'image', false);
       console.log(`[INFO] Media detected - routing to ${selectedModel}`);
+    } else if (isCodeQuery) {
+      selectedModel = selectModel(false, null, true);
+      targetURL = ANTHROPIC_URL; // Claude uses Anthropic API
+      console.log(`[INFO] Code query detected - routing to ${selectedModel}`);
       
       // Set endpoint based on model
       if (selectedModel.includes('gemini')) {
@@ -503,9 +522,36 @@ async function formatMessagesForGemini(messages, systemPrompt, media) {
   };
 }
 
+// Intent detection function
+function detectIntent(message) {
+  const lowerMessage = message.toLowerCase();
+  
+  // GitHub intents
+  if (/\b(commit|standup|what did.*do|what did.*change|daily update|progress)\b/i.test(message)) {
+    return { type: 'github', action: 'list_commits' };
+  }
+  if (/\b(create|file|open|make).*(issue|bug|ticket)\b/i.test(message)) {
+    return { type: 'github', action: 'create_issue' };
+  }
+  
+  // Image/visual intents
+  if (/\b(image|picture|photo|screenshot|what'?s in|describe|analyze|show|see|look)\b/i.test(message)) {
+    return { type: 'vision', action: 'analyze' };
+  }
+  
+  // Document/link intents
+  if (/(https?:\/\/[^\s]+)/i.test(message)) {
+    return { type: 'document', action: 'extract' };
+  }
+  
+  // Default: conversational AI
+  return { type: 'conversation', action: 'chat' };
+}
+
 // Process message endpoint
 app.post('/api/process', async (req, res) => {
-  console.log('[INFO] POST /api/process called');
+  console.error('!!!! ORCHESTRATOR /api/process HIT !!!!'); // Use console.error to bypass buffering
+  console.log('[INFO] ========== POST /api/process called ==========');
   console.log('[DEBUG] Request body:', JSON.stringify(req.body, null, 2));
   
   try {
@@ -513,10 +559,14 @@ app.post('/api/process', async (req, res) => {
     
     console.log('[INFO] Received message:', message);
     console.log('[DEBUG] Context:', {
-      channelId: context.channelId,
-      userId: context.userId,
-      conversationId: context.conversationId
+      channelId: context?.channelId,
+      userId: context?.userId,
+      conversationId: context?.conversationId
     });
+    
+    // ORCHESTRATOR LOGIC: Detect intent and route appropriately
+    const intent = detectIntent(message);
+    console.log(`[ORCHESTRATOR] Detected intent: ${intent.type} - ${intent.action}`);
     
     // Log media data if present
     if (context.media) {
@@ -527,6 +577,47 @@ app.post('/api/process', async (req, res) => {
     const conversationId = context.conversationId;
     // Get existing memory from orchestrator
     const memory = await getOrchestratorMemory(conversationId);
+    
+    // ROUTE BASED ON INTENT - Use GitHub MCP directly
+    if (intent.type === 'github' && githubMCPClient) {
+      console.log(`[ORCHESTRATOR] Routing to GitHub MCP: ${intent.action}`);
+      
+      try {
+        let githubResult;
+        
+        if (intent.action === 'list_commits') {
+          console.log('[ORCHESTRATOR] Calling GitHub MCP list_commits...');
+          const commits = await getRecentCommits('24h');
+          
+          let summary = `📊 *Last 3 Commits*\n\n`;
+          commits.slice(0, 3).forEach((commit, i) => {
+            summary += `${i + 1}. *${commit.message}*\n`;
+            summary += `   _by ${commit.author} at ${new Date(commit.timestamp).toLocaleString()}_\n`;
+            summary += `   ${commit.sha}\n\n`;
+          });
+          
+          githubResult = summary;
+        } else if (intent.action === 'create_issue') {
+          console.log('[ORCHESTRATOR] Calling GitHub MCP create_issue...');
+          const title = message.replace(/create (an? )?(issue|bug|ticket) (for|about)?/i, '').trim();
+          const issue = await createGitHubIssue(title, `Created from Slack\n\n${message}`, ['from-slack']);
+          
+          githubResult = `✅ *Issue Created!*\n\n*#${issue.number}: ${issue.title}*\n${issue.url}`;
+        }
+        
+        console.log('[ORCHESTRATOR] GitHub MCP operation completed');
+        
+        return res.json({
+          response: githubResult,
+          memory: memory,
+          conversationId: conversationId,
+          intent: intent
+        });
+      } catch (githubErr) {
+        console.error('[ERROR] GitHub MCP failed:', githubErr.message);
+        // Fall through to regular processing
+      }
+    }
     
     // Add new message to memory
     const newMemory = [
@@ -660,13 +751,53 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Debug endpoint to check Letta agent tools
+app.get('/debug/letta-tools', async (req, res) => {
+  if (!lettaClient || !LETTA_AGENT_ID) {
+    return res.json({ error: 'Letta not configured' });
+  }
+  
+  try {
+    // Get agent details
+    const agent = await lettaClient.agents.get(LETTA_AGENT_ID);
+    
+    res.json({
+      agentId: LETTA_AGENT_ID,
+      agentName: agent.name,
+      tools: agent.tools || [],
+      toolCount: agent.tools?.length || 0
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error.message,
+      details: 'Failed to fetch agent tools'
+    });
+  }
+});
+
 // Start server
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log(`[INFO] Orchestrator server running on port ${port}`);
   console.log(`[INFO] Active conversations: ${conversationMemory.size}`);
   console.log(`[INFO] Using Lava API for AI processing`);
   console.log(`[INFO] Lava Base URL: ${LAVA_BASE_URL}`);
   console.log(`[INFO] Token present: ${LAVA_FORWARD_TOKEN ? 'Yes' : 'No'}`);
+  
+  // Initialize GitHub MCP client
+  if (process.env.GITHUB_TOKEN && process.env.GITHUB_OWNER && process.env.GITHUB_REPO) {
+    try {
+      githubMCPClient = await initGitHubMCP(
+        process.env.GITHUB_TOKEN,
+        process.env.GITHUB_OWNER,
+        process.env.GITHUB_REPO
+      );
+      console.log(`[SUCCESS] GitHub MCP initialized for ${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`);
+    } catch (error) {
+      console.error('[ERROR] Failed to initialize GitHub MCP:', error.message);
+    }
+  } else {
+    console.log('[WARN] GitHub MCP not configured (missing GITHUB_TOKEN, GITHUB_OWNER, or GITHUB_REPO)');
+  }
 });
 
 export default app;

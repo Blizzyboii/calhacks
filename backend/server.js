@@ -6,6 +6,7 @@ import axios from 'axios';
 import bodyParser from 'body-parser';
 import bolt from '@slack/bolt';
 const { App, LogLevel } = bolt;
+import { getRecentCommits, createIssue } from './github-api.js';
 
 // Verify token is loaded
 console.log('[INFO] SLACK_BOT_TOKEN loaded:', process.env.SLACK_BOT_TOKEN ? 'Yes' : 'No');
@@ -48,6 +49,7 @@ async function readChannelMessages(channelId, limit = 100) {
 async function sendToOrchestrator(message, context = {}, storeOnly = false) {
   try {
     const endpoint = storeOnly ? '/api/store' : '/api/process';
+    console.log(`[DEBUG] Calling orchestrator: ${ORCHESTRATOR_URL}${endpoint}`);
     const response = await axios.post(`${ORCHESTRATOR_URL}${endpoint}`, {
       message: message,
       context: context,
@@ -58,9 +60,11 @@ async function sendToOrchestrator(message, context = {}, storeOnly = false) {
         'Content-Type': 'application/json'
       }
     });
+    console.log(`[DEBUG] Orchestrator responded with status: ${response.status}`);
     return response.data;
   } catch (error) {
-    console.error('Error sending to orchestrator:', error);
+    console.error('[ERROR] Error sending to orchestrator:', error.message);
+    console.error('[ERROR] Full error:', error.response?.data || error);
     return { error: 'Failed to process with orchestrator' };
   }
 }
@@ -481,12 +485,12 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
   try {
     const channelId = event.channel;
     const userId = event.user;
-    const messageText = event.text;
+    let messageText = event.text; // Changed to 'let' so we can modify it
     const threadTs = event.thread_ts || event.ts;
     const conversationId = `${channelId}_${threadTs}`;
     
-    // Read recent messages for context
-    const recentMessages = await readChannelMessages(channelId, 100);
+    // Read recent messages for context (reduced from 100 to 20 for faster processing)
+    const recentMessages = await readChannelMessages(channelId, 20);
     
     // Check if the question is about visual content
     const isVisualQuery = /\b(image|picture|photo|screenshot|show|see|look|visual|what'?s in|describe|analyze)\b/i.test(messageText);
@@ -561,22 +565,14 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
       console.log(`[INFO] Final media count: ${media.images.length} images, ${media.videos.length} videos`);
     }
     
-    // Extract content from any links in the current message AND recent messages
-    let allLinkContent = await extractLinksContent(messageText);
+    // Extract content from any links in the CURRENT message only
+    const linkContent = await extractLinksContent(messageText);
     
-    // Also check recent messages for links
-    for (const msg of recentMessages.slice(0, 10)) {
-      if (msg.text) {
-        const msgLinks = await extractLinksContent(msg.text);
-        allLinkContent = allLinkContent.concat(msgLinks);
-      }
-    }
-    
-    if (allLinkContent.length > 0) {
-      console.log(`[INFO] Found ${allLinkContent.length} links with content`);
+    if (linkContent.length > 0) {
+      console.log(`[INFO] Found ${linkContent.length} links in current message`);
       
       // Store each link's content in Letta for future reference
-      for (const link of allLinkContent) {
+      for (const link of linkContent) {
         await sendToOrchestrator(
           `Document from ${link.url}: ${link.content}`,
           {
@@ -588,7 +584,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
           true // Store only, don't respond
         ).catch(err => console.error(`[ERROR] Failed to store link content: ${err.message}`));
       }
-      console.log(`[SUCCESS] Stored ${allLinkContent.length} link contents in Letta`);
+      console.log(`[SUCCESS] Stored ${linkContent.length} link contents in Letta`);
     }
     
     // Store all recent messages in Letta asynchronously (don't block response)
@@ -596,7 +592,7 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     Promise.all(
       recentMessages
         .filter(msg => !msg.bot_id && msg.text)
-        .slice(0, 20) // Only store last 20 to avoid overwhelming
+        .slice(0, 10) // Only store last 10 for faster processing
         .map(msg => 
           sendToOrchestrator(msg.text, {
             channelId: channelId,
@@ -610,8 +606,73 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
     // Get existing memory from orchestrator
     const memory = await getOrchestratorMemory(conversationId);
     
-    // Try to send to orchestrator, but fallback if it fails
+    // Check if user is asking for GitHub features
+    const isCommitSummary = /\b(commits?|standup|what did (i|we) (do|change|work on)|daily update|progress|github|repo)\b/i.test(messageText);
+    const isCreateIssue = /\b(create|file|open|make) (an? )?(issue|bug|ticket)\b/i.test(messageText);
+    
+    console.log(`[DEBUG] isCommitSummary: ${isCommitSummary}, isCreateIssue: ${isCreateIssue}`);
+    console.log(`[DEBUG] GITHUB_TOKEN present: ${process.env.GITHUB_TOKEN ? 'YES' : 'NO'}`);
+    
+    // Handle GitHub queries directly with GitHub API
+    if (isCommitSummary && process.env.GITHUB_TOKEN) {
+      try {
+        console.log('[INFO] Fetching commits from GitHub API...');
+        const commits = await getRecentCommits(
+          process.env.GITHUB_OWNER || 'Blizzyboii',
+          process.env.GITHUB_REPO || 'calhacks',
+          process.env.GITHUB_TOKEN,
+          3
+        );
+        
+        let summary = `📊 *Daily Standup - Last 3 Commits*\n\n`;
+        commits.forEach((commit, i) => {
+          summary += `${i + 1}. *${commit.message}*\n`;
+          summary += `   _by ${commit.author} on ${commit.date}_\n`;
+          summary += `   <${commit.url}|${commit.sha}>\n\n`;
+        });
+        
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: summary
+        });
+        console.log('[SUCCESS] Posted commit summary to Slack');
+        return; // Done - skip orchestrator
+      } catch (err) {
+        console.error('[ERROR] GitHub API failed:', err.message);
+        // Fall through to orchestrator
+      }
+    }
+    
+    if (isCreateIssue && process.env.GITHUB_TOKEN) {
+      try {
+        console.log('[INFO] Creating GitHub issue...');
+        const issueTitle = messageText.replace(/<@[A-Z0-9]+>/g, '').replace(/create (an? )?(issue|bug|ticket) (for|about)?/i, '').trim();
+        const issue = await createIssue(
+          process.env.GITHUB_OWNER || 'Blizzyboii',
+          process.env.GITHUB_REPO || 'calhacks',
+          process.env.GITHUB_TOKEN,
+          issueTitle,
+          `Created from Slack by <@${userId}>\n\nOriginal message: ${messageText}`,
+          ['from-slack']
+        );
+        
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: `✅ *Issue Created!*\n\n*#${issue.number}: ${issue.title}*\n${issue.url}`
+        });
+        console.log('[SUCCESS] Created GitHub issue');
+        return; // Done - skip orchestrator
+      } catch (err) {
+        console.error('[ERROR] GitHub issue creation failed:', err.message);
+        // Fall through to orchestrator
+      }
+    }
+    
+    // Try to send to orchestrator for non-GitHub queries
     try {
+      console.log('[INFO] Sending to orchestrator:', messageText.substring(0, 100) + '...');
       const orchestratorResponse = await sendToOrchestrator(messageText, {
         channelId,
         userId,
@@ -621,15 +682,41 @@ slackApp.event('app_mention', async ({ event, client, logger }) => {
         media: media.hasMedia ? media : undefined
       });
       
+      console.log('[INFO] Got orchestrator response:', orchestratorResponse ? 'YES' : 'NO');
+      console.log('[DEBUG] Response:', JSON.stringify(orchestratorResponse).substring(0, 300));
+      
       // Post orchestrator response back to Slack
       if (orchestratorResponse.response) {
         let responseText = orchestratorResponse.response;
         
-        // Add citations if we used recent messages for context
-        if (recentMessages.length > 0) {
+        // Add citations - only if response actually uses context from messages
+        if (recentMessages.length > 0 && responseText.length > 100) {
+          // Extract keywords from user's question
+          const questionKeywords = messageText
+            .toLowerCase()
+            .replace(/<@[A-Z0-9]+>/g, '')
+            .split(/\s+/)
+            .filter(word => word.length > 3 && !['what', 'when', 'where', 'which', 'that', 'this', 'with', 'from'].includes(word));
+          
+          // Find messages that contain keywords from the question or response
           const relevantMessages = recentMessages
-            .filter(msg => !msg.bot_id && msg.text)
-            .slice(0, 3); // Show up to 3 recent messages as sources
+            .filter(msg => {
+              if (msg.bot_id || !msg.text || msg.user === userId) return false;
+              
+              // Skip system messages (joined, left, etc.)
+              if (/has (joined|left) the (channel|server)/i.test(msg.text)) return false;
+              
+              const msgLower = msg.text.toLowerCase();
+              
+              // Check if message contains any keywords from the question
+              const hasKeyword = questionKeywords.some(keyword => msgLower.includes(keyword));
+              
+              // Check if message is substantial (not just short reactions)
+              const isSubstantial = msg.text.length > 20;
+              
+              return hasKeyword && isSubstantial;
+            })
+            .slice(0, 2); // Max 2 citations to keep it clean
           
           if (relevantMessages.length > 0) {
             responseText += '\n\n_Sources:_';
